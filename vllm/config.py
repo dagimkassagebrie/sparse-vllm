@@ -672,21 +672,68 @@ class CacheConfig:
                 "Run with --disable-sliding-window to use prefix caching.")
 
     def _verify_sparse_kv_cache(self) -> None:
-        if self.sparse_kv_cache_method not in (None, "random", "h2o"):
-            raise ValueError("Unknown KV cache sparsification method: "
-                             f"{self.sparse_kv_cache_method}")
+        """Validate sparse KV cache configuration parameters."""
+        # Valid sparsification methods
+        VALID_METHODS = (None, "random", "h2o")
+        # Valid internal memory management strategies
+        VALID_INTERNAL_STRATEGIES = ("no-op", "free-block", "sparse-copy", "spvllm")
+        # Minimum reasonable budget (must allow for at least some context)
+        MIN_BUDGET = 16
+
+        if self.sparse_kv_cache_method not in VALID_METHODS:
+            raise ValueError(
+                f"Unknown KV cache sparsification method: '{self.sparse_kv_cache_method}'. "
+                f"Valid options are: {', '.join(str(m) for m in VALID_METHODS)}"
+            )
+
+        # Skip remaining validation if sparsification is disabled
+        if self.sparse_kv_cache_method is None:
+            return
+
+        # Validate budget
+        if self.sparse_kv_cache_budget < MIN_BUDGET:
+            raise ValueError(
+                f"sparse_kv_cache_budget must be at least {MIN_BUDGET}, "
+                f"got {self.sparse_kv_cache_budget}. A very small budget may "
+                "cause severe quality degradation."
+            )
+
+        # Validate num_per_evict
+        if self.sparse_kv_cache_num_per_evict <= 0:
+            raise ValueError(
+                f"sparse_kv_cache_num_per_evict must be positive, "
+                f"got {self.sparse_kv_cache_num_per_evict}"
+            )
 
         if self.sparse_kv_cache_num_per_evict >= self.sparse_kv_cache_budget:
             raise ValueError(
-                "Number of tokens per eviction "
-                f"(={self.sparse_kv_cache_num_per_evict}) must be strictly "
-                "less than the KV cache budget "
-                f"(={self.sparse_kv_cache_budget})")
+                f"sparse_kv_cache_num_per_evict ({self.sparse_kv_cache_num_per_evict}) "
+                f"must be strictly less than sparse_kv_cache_budget "
+                f"({self.sparse_kv_cache_budget}). Otherwise, all tokens would be "
+                "evicted in a single step."
+            )
 
-        if self.sparse_kv_cache_internal not in ("no-op", "free-block",
-                                                 "sparse-copy", "spvllm"):
-            raise ValueError("Unknown KV cache internal memory management "
-                             f"strategy: {self.sparse_kv_cache_internal}")
+        # Validate internal strategy
+        if self.sparse_kv_cache_internal not in VALID_INTERNAL_STRATEGIES:
+            raise ValueError(
+                f"Unknown KV cache internal memory management strategy: "
+                f"'{self.sparse_kv_cache_internal}'. "
+                f"Valid options are: {', '.join(VALID_INTERNAL_STRATEGIES)}"
+            )
+
+        # Warn about strategy trade-offs
+        if self.sparse_kv_cache_internal == "no-op":
+            logger.warning(
+                "Using 'no-op' internal strategy: evicted slots remain allocated, "
+                "causing high internal fragmentation. Consider 'spvllm' for better "
+                "memory efficiency."
+            )
+        elif self.sparse_kv_cache_internal == "sparse-copy":
+            logger.warning(
+                "Using 'sparse-copy' internal strategy: this requires additional "
+                "memory for destination blocks and may cause preemption under "
+                "memory pressure. Consider 'spvllm' for better performance."
+            )
 
     def verify_with_parallel_config(
         self,
