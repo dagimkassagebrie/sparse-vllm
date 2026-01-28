@@ -1,93 +1,245 @@
-# sparse-vllm
+# SpvLLM: Efficient KV Cache Sparsification in vLLM
 
-> This is the repository for the Harvard CS243 (Fall 2024) final project: *SpvLLM: Efficient KV Cache Sparsification in vLLM*.
+> Harvard CS243 (Fall 2024) Final Project
+
+**Authors:** Yao Xiao, Dagim Gebrie
+
+## Overview
+
+SpvLLM implements efficient KV cache sparsification in vLLM, reducing memory fragmentation caused by token eviction during LLM inference. Our approach achieves:
+
+- **Up to 55.7% reduction** in internal fragmentation
+- **Up to 2.21× higher throughput** compared to baseline vLLM
+- **Up to 48.9% lower latency** for inter-token generation
+
+## The Problem
+
+When using KV cache sparsification to evict less important tokens, internal fragmentation occurs because evicted slots leave "holes" in the KV cache blocks. Existing approaches have significant limitations:
+
+| Strategy | Description | Limitation |
+|----------|-------------|------------|
+| **no-op** | Mark slots inactive, don't reclaim | High fragmentation |
+| **free-block** | Free blocks only when fully empty | Moderate fragmentation |
+| **sparse-copy** | Copy active tokens to new blocks | Copy overhead, causes preemption |
+
+## Our Solution: SpvLLM
+
+SpvLLM leverages a key insight: **attention computation is order-agnostic**. The scaled dot-product attention is:
+
+```
+output = Σ softmax(QK^T/√d) × V
+```
+
+Since this is a weighted sum, the order of tokens in the KV cache doesn't affect the result. Therefore, **new tokens can directly fill evicted slots** instead of requiring sequential allocation or copying.
+
+### How It Works
+
+1. When a token is evicted, mark its slot as "deactivated" (available for reuse)
+2. When a new token arrives, check for deactivated slots
+3. If found, write the new token's KV cache to that slot instead of allocating new space
+4. Update the slot mapping to point to the reused slot
+
+This eliminates fragmentation without copying overhead.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Scheduler                             │
+│  - Collects reused_slot info from sequences                 │
+│  - Passes to SequenceGroupMetadata                          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     Block Manager                            │
+│  - append_slots() detects available deactivated slots       │
+│  - Computes physical slot address for reuse                 │
+│  - Sets seq.reused_slot with the address                    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Attention Backend                         │
+│  - Uses reused_slot for slot_mapping instead of sequential  │
+│  - KV cache written to correct physical location            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Project Structure
+
+```
+sparse-vllm/
+├── vllm/
+│   ├── kv_cache_sp/           # KV cache sparsification strategies
+│   │   ├── base.py            # Base class and output dataclass
+│   │   ├── h2o.py             # H2O (Heavy-Hitter Oracle) implementation
+│   │   └── random.py          # Random eviction baseline
+│   ├── core/
+│   │   ├── block_manager_v1.py # Block management with slot reuse
+│   │   └── scheduler.py       # Integration with vLLM scheduler
+│   ├── attention/
+│   │   └── backends/utils.py  # Slot mapping with reuse support
+│   └── config.py              # Sparsification configuration
+├── csrc/
+│   └── attention/
+│       └── attention_kernels.cu # CUDA kernels with block masks
+├── cs243/
+│   ├── benchmark.py           # Experiment orchestration
+│   ├── analyze.py             # Log parsing and metrics
+│   ├── plot_metrics.py        # Visualization generation
+│   └── plot_frag.py           # Fragmentation plots
+└── ResearchReport.pdf         # Full research paper
+```
 
 ## Table of Contents
 
-- [AWS Setup](#aws-setup)
-- [Virtual Machine Setup](#virtual-machine-setup)
-- [VLLM Setup](#vllm-setup)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Configuration Options](#configuration-options)
 - [Experiments](#experiments)
+- [AWS Setup](#aws-setup)
+
+## Installation
+
+### Prerequisites
+
+- CUDA 12.x
+- Python 3.9+
+- NVIDIA GPU with compute capability 7.0+
+
+### Install from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/dagimkassagebrie/sparse-vllm.git
+cd sparse-vllm
+
+# Install vLLM with SpvLLM modifications
+pip install -v -e .
+
+# Install experiment dependencies
+pip install -r requirements-dev.txt
+pip install seaborn
+```
+
+## Quick Start
+
+### Using SpvLLM with vLLM Server
+
+```bash
+vllm serve facebook/opt-125m \
+    --sparse-kv-cache-method h2o \
+    --sparse-kv-cache-budget 512 \
+    --sparse-kv-cache-internal spvllm
+```
+
+### Programmatic Usage
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="facebook/opt-125m",
+    sparse_kv_cache_method="h2o",
+    sparse_kv_cache_budget=512,
+    sparse_kv_cache_internal="spvllm",
+)
+
+prompts = ["Hello, my name is"]
+outputs = llm.generate(prompts, SamplingParams(max_tokens=100))
+```
+
+## Configuration Options
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--sparse-kv-cache-method` | Sparsification algorithm (`h2o`, `random`, or `None`) | `None` |
+| `--sparse-kv-cache-budget` | Max tokens to keep in KV cache | `2048` |
+| `--sparse-kv-cache-num-per-evict` | Tokens to evict per step | `1` |
+| `--sparse-kv-cache-internal` | Memory strategy (`no-op`, `free-block`, `sparse-copy`, `spvllm`) | `spvllm` |
+
+### Internal Strategy Comparison
+
+| Strategy | Fragmentation | Overhead | Best For |
+|----------|--------------|----------|----------|
+| `no-op` | High | None | Testing only |
+| `free-block` | Medium | Low | Memory-constrained |
+| `sparse-copy` | Low | High | Not recommended |
+| `spvllm` | **Low** | **Minimal** | **Production use** |
+
+## Experiments
+
+### Download Dataset
+
+```bash
+wget -O ./benchmarks/sharegpt.json \
+    https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
+```
+
+### Run Benchmarks
+
+```bash
+# Run all experiments
+./run243.sh
+
+# Or run individual benchmark
+python cs243/benchmark.py \
+    --sparse-kv-cache-method h2o \
+    --sparse-kv-cache-budget 512 \
+    --sparse-kv-cache-internal spvllm
+
+# Analyze results
+python cs243/analyze.py
+
+# Generate plots
+python cs243/plot_metrics.py
+```
+
+Results are saved to `cs243/logs/` and plots to `cs243/plots/`.
 
 ## AWS Setup
 
-- Go to the service quotas dashboard then Amazon EC2 (https://us-east-2.console.aws.amazon.com/servicequotas/home/services/ec2/quotas, change `us-east-2` to your region). Search for "Running On-Demand G and VT instances", then request increase quota to at least 8 vCPUs. *This needs to be done only once.*
-- Go to [EC2 dashboard](https://us-east-2.console.aws.amazon.com/ec2/home) (choose the correct region), go to instances in the sidebar then launch instance. Give it a name, choose "Ubuntu Server 22.04 LTS (HVM), SSD Volume Type" for the Amazon Machine Image, and use the default x86_64 architecture. For instance type, search for `g4dn.2xlarge` or larger g-family or p-family instances with NVIDIA GPUs. Select a key pair (see [course infra page](https://github.com/minlanyu/cs243-site/blob/fall2024/infra.md)). Select an existing security group that allows all IPv4 (see course warmup project), or let it create a new security group. Configure storage to 60GiB, and leave other configurations unchanged. Launch the instance.
-- Connect to the instance with your key pair. There is a connect instruction if you click on your instance in AWS and click connect.
-
 <details>
-<summary>CHMOD 400 on Windows</summary>
-<p>
+<summary>Click to expand AWS setup instructions</summary>
 
-Note that in the connection instructions it requires `chmod 400` to make the key not publicly available. To achieve the equivalent on Windows, do the following in Powershell:
+### Request GPU Quota
 
-```cmd
-icacls.exe "/PATH/TO/PEM/FILE" /reset
-icacls.exe "/PATH/TO/PEM/FILE" /grant:r "$($env:username):(r)"
-icacls.exe "/PATH/TO/PEM/FILE" /inheritance:r
-```
+Go to [EC2 Service Quotas](https://us-east-2.console.aws.amazon.com/servicequotas/home/services/ec2/quotas) and request increase for "Running On-Demand G and VT instances" to at least 8 vCPUs.
 
-</p>
-</details>
+### Launch Instance
 
-<details>
-<summary>Connecting VSCode to the server</summary>
-<p>
+1. Go to [EC2 Dashboard](https://us-east-2.console.aws.amazon.com/ec2/home)
+2. Launch instance with:
+   - AMI: Ubuntu Server 22.04 LTS
+   - Instance type: `g4dn.2xlarge` or larger
+   - Storage: 60 GiB
 
-To connect with VSCode, add the following to the SSH configuration file:
-
-```
-Host aws-ec2-cs243
-    HostName ec2-3-17-72-136.us-east-2.compute.amazonaws.com
-    User ubuntu
-    IdentityFile /PATH/TO/PEM/FILE
-```
-
-</p>
-</details>
-
-## Virtual Machine Setup
-
-Now inside the server, first make sure system dependencies are up-to-date and install other needed packages:
+### Install Dependencies
 
 ```bash
-sudo apt-get update
-sudo apt-get upgrade -y
+# System packages
+sudo apt-get update && sudo apt-get upgrade -y
 sudo apt-get install -y ccache
-which ccache  # Confirm that ccache is discoverable
-```
 
-Install micromamba:
-
-```bash
+# Conda
 curl -L -O https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
-bash Miniforge3-Linux-x86_64.sh  # Follow the prompts (Enter, yes, Enter, Enter)
-eval "$(/home/ubuntu/miniforge3/bin/conda shell.bash hook)"
-conda init
-rm Miniforge3-Linux-x86_64.sh
-```
+bash Miniforge3-Linux-x86_64.sh
+source ~/.bashrc
 
-Install CUDA toolkit:
-
-```bash
+# CUDA
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt-get update
-sudo apt-get -y install cuda-toolkit-12-6
-rm cuda-keyring_1.1-1_all.deb
-```
+sudo apt-get update && sudo apt-get -y install cuda-toolkit-12-6
 
-Install CUDA driver:
-
-```bash
+# NVIDIA Driver
 sudo apt-get install -y nvidia-open
-sudo reboot  # You would need to reconnect to the instance after a few seconds
-nvidia-smi  # Check that it worked
+sudo reboot
 ```
 
-## VLLM Setup
+### Environment Variables
 
-Set enviroment variables to (1) let vLLM discover cuda, (2) reduce the number of compilation jobs that run simultaneously (8 jobs and 32GiB memory sometimes gives OOM, 6 jobs also gives OOM in rare occasions, and 4 jobs is currently safe by my experience), (3) use `xformers` backend (and thus disable the `vllm-flash-attn` build from source), and (4) disable build of `_moe_C` because we are at least not using those for now. You may add the following to `~/.bashrc` then do `source ~/.bashrc` to reload the configurations:
+Add to `~/.bashrc`:
 
 ```bash
 export CUDA_HOME=/usr/local/cuda
@@ -97,55 +249,26 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 export DISABLE_MOE_BUILD=1
 ```
 
-You can confirm that vLLM can discover `CUDA_HOME` and make sure `nvcc` compiler is in `PATH` by:
+</details>
 
-```bash
-nvcc --version  # Check nvcc
-${CUDA_HOME}/bin/nvcc --version  # Check nvcc is in CUDA_HOME
+## Citation
+
+If you use SpvLLM in your research, please cite:
+
+```bibtex
+@misc{spvllm2024,
+  title={SpvLLM: Efficient KV Cache Sparsification in vLLM},
+  author={Xiao, Yao and Gebrie, Dagim},
+  year={2024},
+  institution={Harvard University},
+  note={CS243 Fall 2024 Final Project}
+}
 ```
 
-Configure `git`:
+## License
 
-```bash
-git config --global core.editor vim  # Or other editors you prefer
-git config --global user.name YOUR_USERNAME
-git config --global user.email YOUR_EMAIL
-```
+This project builds on [vLLM](https://github.com/vllm-project/vllm) and is subject to its Apache 2.0 license.
 
-Clone the repository and build vLLM. Note that you should currently be in the conda base environment that is by default activated.
+## Acknowledgments
 
-```bash
-git clone https://github.com/Charlie-XIAO/sparse-vllm.git  # Or use ssh
-cd sparse-vllm
-pip install -v -e .  # This can take very long
-python -c "import vllm; print(vllm.__version__)"  # Validate the installation
-```
-
-Finally install the dependencies.
-
-```bash
-pip install -r requirements-dev.txt
-pip install seaborn  # Needed for experiments
-```
-
-For linting, run:
-
-```bash
-./format.sh
-```
-
-## Experiments
-
-Make sure you are in the current directory. First download the ShareGPT dataset:
-
-```bash
-wget -O ./benchmarks/sharegpt.json https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
-```
-
-Then to reproduce our experiment results, simply run:
-
-```bash
-./run243.sh
-```
-
-The plots will be available under the `./cs243/plots` directory.
+We thank Professor Minlan Yu for her guidance and mentorship throughout this project.
