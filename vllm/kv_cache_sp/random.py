@@ -1,26 +1,37 @@
+"""Random KV cache sparsification strategy (baseline for comparison)."""
+
+import math
 from typing import List
 
 import numpy as np
 import torch
 
 from vllm.core.block_manager_v1 import BlockSpaceManagerV1
-from vllm.kv_cache_sp.base import (KVCacheSparsifierBase,
-                                   KVCacheSparsifierStepOutput)
+from vllm.kv_cache_sp.base import (
+    KVCacheSparsifierBase,
+    KVCacheSparsifierStepOutput,
+)
 from vllm.outputs import RequestOutput
 
 
 class RandomKVCacheSparsifier(KVCacheSparsifierBase):
-    """A random KV cache sparsifier.
+    """Random KV cache sparsifier for baseline comparison.
 
-    This is completely for experimental purposes. It randomly evicts tokens
-    when exceeding KV cache budget which makes no sense.
+    Randomly evicts tokens when exceeding KV cache budget. This is intended
+    only for experimental comparison - random eviction performs poorly in
+    practice since it ignores token importance.
     """
 
-    def step(self, block_manager: BlockSpaceManagerV1, seq_id: int,
-             attn_scores: torch.Tensor) -> KVCacheSparsifierStepOutput:
+    def step(
+        self,
+        block_manager: BlockSpaceManagerV1,
+        seq_id: int,
+        attn_scores: torch.Tensor
+    ) -> KVCacheSparsifierStepOutput:
+        """Execute one random sparsification step."""
         num_slots = attn_scores.size(2)
 
-        # Flatten block mask and get indices of active slots
+        # Get current active slots from block masks
         block_masks = block_manager.block_tables[seq_id].masks()
         block_size = len(block_masks[0])
         total_block_mask = np.concatenate(block_masks)[:num_slots]
@@ -28,51 +39,62 @@ class RandomKVCacheSparsifier(KVCacheSparsifierBase):
         num_active_slots = len(active_slots)
 
         if num_active_slots <= self.budget:
-            # We have not exceeded the budget so no need for eviction
             return KVCacheSparsifierStepOutput(
                 do_evict=False,
                 num_active_slots=num_active_slots,
                 num_total_slots=len(block_masks) * block_size,
-                num_removed_blocks=0)
+                num_evicted_tokens=0,
+                num_migrate_dst_blocks=0,
+                slots_to_migrate=[],
+            )
 
-        # Randomly choose slots to evict from the active slots
-        slots_to_evict = np.random.choice(active_slots,
-                                          self.num_per_evict,
-                                          replace=False)
+        # Randomly select slots to evict
+        slots_to_evict = np.random.choice(
+            active_slots, self.num_per_evict, replace=False
+        )
 
-        num_removed_blocks = 0
+        num_evicted_tokens = 0
+        num_migrate_dst_blocks = 0
+        slots_to_migrate: List[int] = []
 
         if self.internal == "no-op":
             block_manager.deactivate_slots(seq_id, slots_to_evict)
 
         elif self.internal == "free-block":
             block_manager.deactivate_slots(seq_id, slots_to_evict)
-            # Free fully deactivate blocks and slice the attention scores
-            # accordingly to keep consistency
-            removed_blocks = block_manager.free_fully_deactivated_blocks(
-                seq_id)
-            # Update for the returned step output
+            removed_blocks = block_manager.free_fully_deactivated_blocks(seq_id)
             block_masks = block_manager.block_tables[seq_id].masks()
-            num_removed_blocks = len(removed_blocks)
+            num_evicted_tokens = len(removed_blocks) * block_size
 
         elif self.internal == "sparse-copy":
-            raise NotImplementedError  # TODO(Charlie-XIAO)!
+            num_evicted_tokens = len(slots_to_evict)
+            num_migrate_dst_blocks = math.ceil(
+                (num_slots - num_evicted_tokens + 1) / block_size
+            )
+            slots_to_migrate = np.setdiff1d(
+                np.arange(num_slots), slots_to_evict
+            ).tolist()
 
         elif self.internal == "spvllm":
-            raise NotImplementedError  # TODO(Charlie-XIAO)
+            block_manager.deactivate_slots(seq_id, slots_to_evict)
+            removed_blocks = block_manager.free_fully_deactivated_blocks(seq_id)
+            block_masks = block_manager.block_tables[seq_id].masks()
+            num_evicted_tokens = len(slots_to_evict)
 
         else:
             raise ValueError(
-                "Unrecognized KV cache internal memory management "
-                f"strategy: {self.internal}")
+                f"Unrecognized KV cache internal strategy: {self.internal}"
+            )
 
-        # The block masks have been changed in the previous step; the stats need
-        # to be based on the updated version
         return KVCacheSparsifierStepOutput(
             do_evict=True,
             num_active_slots=num_active_slots,
             num_total_slots=len(block_masks) * block_size,
-            num_removed_blocks=num_removed_blocks)
+            num_evicted_tokens=num_evicted_tokens,
+            num_migrate_dst_blocks=num_migrate_dst_blocks,
+            slots_to_migrate=slots_to_migrate,
+        )
 
     def clean_self(self, outputs: List[RequestOutput]) -> None:
-        pass  # No-op
+        """No cleanup needed for random sparsifier."""
+        pass
