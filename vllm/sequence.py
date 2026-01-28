@@ -471,6 +471,11 @@ class Sequence:
         # after it is used.
         self._slots_to_migrate: List[int] = []
 
+        # Used for tracking the reused slot when using SpvLLM strategy. This is
+        # the physical slot address where the new token's KV should be written.
+        # None means no slot reuse, use normal sequential allocation.
+        self._reused_slot: Optional[int] = None
+
     @property
     def n_blocks(self) -> int:
         return (self.get_len() + self.block_size - 1) // self.block_size
@@ -571,6 +576,7 @@ class Sequence:
         """Reset the sequence states for recomputation."""
         self._num_migrate_dst_blocks = 0
         self._slots_to_migrate = []
+        self._reused_slot = None
         self.data.reset_state_for_recompute()
 
     def append_token_id(self, token_id: int, logprobs: Dict[int,
@@ -660,6 +666,13 @@ class Sequence:
 
     def set_slots_to_migrate(self, slots_to_migrate: List[int]) -> None:
         self._slots_to_migrate = slots_to_migrate
+
+    @property
+    def reused_slot(self) -> Optional[int]:
+        return self._reused_slot
+
+    def set_reused_slot(self, reused_slot: Optional[int]) -> None:
+        self._reused_slot = reused_slot
 
     def __repr__(self) -> str:
         return (f"Sequence(seq_id={self.seq_id}, "
@@ -1027,6 +1040,10 @@ class SequenceGroupMetadata(
     cross_block_table: Optional[List[int]] = None
     prompt_adapter_request: Optional[PromptAdapterRequest] = None
     token_chunk_size: Optional[int] = None
+    # Reused slots for SpvLLM strategy. Maps seq_id to physical slot address.
+    # When a slot is reused, this tells the attention backend where to write
+    # the new token's KV cache instead of using sequential allocation.
+    reused_slots: Optional[Dict[int, int]] = None
 
     ### Stateful fields that are lazily defined. ###
     # The number of speculative tokens adopted in this request.

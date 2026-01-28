@@ -1302,12 +1302,20 @@ class Scheduler:
                 encoder_seq_data = None
                 cross_block_table = None
 
+            # seq_id -> reused slot (for SpvLLM)
+            reused_slots: Dict[int, int] = {}
+
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                 seq_id = seq.seq_id
                 seq_data[seq_id] = seq.data
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 block_masks[seq_id] = self.block_manager.get_block_mask(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
+                # Collect reused slot for SpvLLM
+                if seq.reused_slot is not None:
+                    reused_slots[seq_id] = seq.reused_slot
+                    # Reset after collecting to avoid using stale info
+                    seq.set_reused_slot(None)
 
             if self.cache_config.enable_prefix_caching:
                 common_computed_block_nums = (
@@ -1359,6 +1367,8 @@ class Scheduler:
                     multi_modal_data=seq_group.multi_modal_data
                     if scheduler_outputs.num_prefill_groups > 0 else None,
                     prompt_adapter_request=seq_group.prompt_adapter_request,
+                    # SpvLLM: pass reused slot info for correct KV cache writing
+                    reused_slots=reused_slots if reused_slots else None,
                 )
             else:
                 # When SPMD mode is enabled, we only send delta data except for

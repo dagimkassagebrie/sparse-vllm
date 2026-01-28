@@ -209,6 +209,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             block_tables: Optional[Dict[int, List[int]]],
             block_masks: Optional[Dict[int, List[np.ndarray]]],
             computed_block_nums: List[int],
+            reused_slots: Optional[Dict[int, int]] = None,
             n_seqs: int = 0,
 
             # Input tokens and positions.
@@ -259,6 +260,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.block_tables = block_tables
             self.block_masks = block_masks
             self.computed_block_nums = computed_block_nums
+            self.reused_slots = reused_slots
             self.n_seqs = n_seqs
             self.encoder_seq_len = encoder_seq_len
 
@@ -389,7 +391,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             is_prompt=True,
             block_tables=None,
             block_masks=None,
-            computed_block_nums=[])
+            computed_block_nums=[],
+            reused_slots=None)
 
     def init_cached_inter_data(self, *args, **kwargs):
         assert len(args) == 0
@@ -725,6 +728,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             block_tables=seq_group_metadata.block_tables,
             block_masks=seq_group_metadata.block_masks,
             computed_block_nums=seq_group_metadata.computed_block_nums,
+            reused_slots=seq_group_metadata.reused_slots,
             reinit=True,
             reinit_use_defaults=True,
             encoder_seq_len=encoder_seq_len)

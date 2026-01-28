@@ -197,9 +197,21 @@ class CommonMetadataBuilder(AttentionMetadataBuilder[TAttentionMetadata]):
             start_idx = compute_slot_mapping_start_idx(
                 is_prompt, query_len, context_len, self.sliding_window,
                 self.use_v2_block_manager)
-            compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
-                                 seq_len, context_len, start_idx,
-                                 self.block_size, inter_data.block_tables)
+
+            # Check if this sequence has a reused slot (SpvLLM)
+            reused_slot = None
+            if (inter_data.reused_slots is not None
+                    and seq_id in inter_data.reused_slots):
+                reused_slot = inter_data.reused_slots[seq_id]
+
+            # For decode with reused slot, use the reused slot address directly
+            if reused_slot is not None and not is_prompt and query_len == 1:
+                # SpvLLM: use the reused slot instead of computing normally
+                self.slot_mapping.append(reused_slot)
+            else:
+                compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
+                                     seq_len, context_len, start_idx,
+                                     self.block_size, inter_data.block_tables)
 
     def build(self, seq_lens: List[int], query_lens: List[int],
               cuda_graph_pad_size: int, batch_size: int):

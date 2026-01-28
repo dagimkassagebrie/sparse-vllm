@@ -485,8 +485,17 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             first_deactivated_slot = block_table.first_deactivated_slot()
             if first_deactivated_slot is not None:
                 # Reuse the first deactivated slot
+                block_idx, slot_offset = first_deactivated_slot
                 block_table.activate_slot(first_deactivated_slot)
+                # Compute and store the physical slot address for the reused slot
+                # This tells the attention backend where to write the new KV cache
+                physical_slot = (block_table[block_idx].block_number *
+                                 self.block_size + slot_offset)
+                seq.set_reused_slot(physical_slot)
                 return []
+            else:
+                # No deactivated slot to reuse, clear any previous reused slot
+                seq.set_reused_slot(None)
 
         # We want to append the token to the last physical block.
         last_block = block_table[-1]
